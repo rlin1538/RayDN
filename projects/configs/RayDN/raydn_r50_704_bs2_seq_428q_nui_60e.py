@@ -1,6 +1,6 @@
 _base_ = [
-    '../../../mmdetection3d/configs/_base_/datasets/nus-3d.py',
-    '../../../mmdetection3d/configs/_base_/default_runtime.py'
+    '../_base_/datasets/nus-3d.py',
+    '../_base_/default_runtime.py'
 ]
 backbone_norm_cfg = dict(type='LN', requires_grad=True)
 plugin=True
@@ -18,8 +18,8 @@ class_names = [
     'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
 ]
 
-num_gpus = 8
-batch_size = 2
+num_gpus = 1
+batch_size = 1
 num_iters_per_epoch = 28130 // (num_gpus * batch_size)
 num_epochs = 60
 
@@ -232,7 +232,7 @@ data = dict(
 
 optimizer = dict(
     type='AdamW', 
-    lr=4e-4, # bs 8: 2e-4 || bs 16: 4e-4
+    lr=2e-4, # bs 8: 2e-4 || bs 16: 4e-4
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.25), 
@@ -254,5 +254,5 @@ find_unused_parameters=False #### when use checkpoint, find_unused_parameters mu
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=3)
 runner = dict(
     type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)
-load_from='ckpts/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim-remapped.pth'
-resume_from=None
+load_from=None#'ckpts/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim-remapped.pth'
+resume_from='work_dirs/raydn_r50_704_bs2_seq_428q_nui_60e/latest.pth'

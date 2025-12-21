@@ -10,12 +10,22 @@ import torch
 from mmcv import Config
 from mmcv.parallel import MMDataParallel
 from mmcv.runner import load_checkpoint, wrap_fp16_model
-
+from pytorch_model_summary import summary
 from mmdet3d.datasets import build_dataloader, build_dataset
 from mmdet3d.models import build_detector
+from projects.mmdet3d_plugin.models.utils.flops_counter import flops_counter
 import os
 import sys
 sys.path.append('./')
+class WrappedModel(torch.nn.Module):
+    def __init__(self, model, example_input):
+        super().__init__()
+        self.model = model
+        self.example_input = example_input
+
+    def forward(self, *args):
+        # 直接使用真实的 dict
+        return self.model(return_loss=False, rescale=True, **self.example_input)
 def parse_args():
     parser = argparse.ArgumentParser(description='MMDet benchmark a model')
     parser.add_argument('config', help='test config file path')
@@ -61,6 +71,7 @@ def main():
                 plg_lib = importlib.import_module(_module_path)
     # build the dataloader
     # TODO: support multiple images per gpu (only minor changes are needed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset = build_dataset(cfg.data.test)
     data_loader = build_dataloader(
         dataset,
@@ -75,12 +86,18 @@ def main():
     # fp16_cfg = cfg.get('fp16', None)
     # if fp16_cfg is not None:
     #     wrap_fp16_model(model)
-    # load_checkpoint(model, args.checkpoint, map_location='cpu')
+    # load_checkpoint(model, args.checkpoint, map_location=device)
 
 
     model = MMDataParallel(model, device_ids=[0])
+    # model.device_ids=None
 
     model.eval()
+    pytorch_total_params = sum(p.numel() for p in model.parameters())
+    trainable_pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    print('Total - ', pytorch_total_params / 1000000., 'M')
+    print('Trainable - ', trainable_pytorch_total_params / 1000000., 'M')
 
     # the first several iterations may be very slow so skip them
     num_warmup = 5
@@ -93,7 +110,12 @@ def main():
         start_time = time.perf_counter()
 
         with torch.no_grad():
+            # model = WrappedModel(model, data)
+            # macs, params = flops_counter(model, data)
+            # print(f'flops: {macs / 1000000.0} M, params: {params / 1000000.0} M')
             model(return_loss=False, rescale=True, **data)
+            # analysis_results = get_model_complexity_info(model, input_shape= (3,704,256))
+            # print(analysis_results['out_table'])
 
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start_time

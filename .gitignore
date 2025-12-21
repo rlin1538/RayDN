@@ -1,0 +1,9 @@
+vis
+val
+data
+ckpts
+result_vis
+work_dirs
+test
+*.png
+weights

@@ -73,7 +73,7 @@ class PETRMultiheadFlashAttention(BaseModule):
 
         self.embed_dims = embed_dims
         self.num_heads = num_heads
-        self.batch_first = True
+        self.batch_first = batch_first
 
         self.attn = FlashMHA(embed_dims, num_heads, attn_drop, dtype=torch.float16, device='cuda',
                                           **kwargs)

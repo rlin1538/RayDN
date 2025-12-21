@@ -1,3 +1,7 @@
+# Copyright (c) Wang, Z
+# ------------------------------------------------------------------------
+# Modified from StreamPETR (https://github.com/exiawsh/StreamPETR)
+# Copyright (c) Shihao Wang
 # ------------------------------------------------------------------------
 # Copyright (c) 2022 megvii-model. All Rights Reserved.
 # ------------------------------------------------------------------------
@@ -7,18 +11,21 @@
 # Modified from mmdetection3d (https://github.com/open-mmlab/mmdetection3d)
 # Copyright (c) OpenMMLab. All rights reserved.
 # ------------------------------------------------------------------------
-#  Modified by Shihao Wang
-# ------------------------------------------------------------------------
-import numpy as np
-from mmdet.datasets import DATASETS
-from mmdet3d.datasets import NuScenesDataset
-from mmdet.datasets import DATASETS
+
+import os.path as osp
 import torch
 import numpy as np
-from nuscenes.eval.common.utils import Quaternion
-from mmcv.parallel import DataContainer as DC
 import random
 import math
+import mmcv
+from mmdet3d.datasets import NuScenesDataset
+from mmdet.datasets import DATASETS
+from nuscenes.eval.common.utils import Quaternion
+from mmcv.parallel import DataContainer as DC
+from mmdet.datasets.api_wrappers import COCO
+from mmcv.ops.nms import batched_nms
+
+
 @DATASETS.register_module()
 class CustomNuScenesDataset(NuScenesDataset):
     r"""NuScenes Dataset.
@@ -26,7 +33,8 @@ class CustomNuScenesDataset(NuScenesDataset):
     This datset only add camera intrinsics and extrinsics to the results.
     """
 
-    def __init__(self, collect_keys, seq_mode=False, seq_split_num=1, num_frame_losses=1, queue_length=8, random_length=0, *args, **kwargs):
+    def __init__(self, collect_keys, seq_mode=False, seq_split_num=1, num_frame_losses=1, queue_length=8, random_length=0,
+                 seq_length=-1, proposal_file=None, ann_2d_file=None, proposal_nms=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.queue_length = queue_length
         self.collect_keys = collect_keys
@@ -37,8 +45,137 @@ class CustomNuScenesDataset(NuScenesDataset):
             self.num_frame_losses = 1
             self.queue_length = 1
             self.seq_split_num = seq_split_num
+            self.seq_length = seq_length
             self.random_length = 0
             self._set_sequence_group_flag() # Must be called after load_annotations b/c load_annotations does sorting.
+
+        self.proposal_file = proposal_file
+        self.ann_2d_file = ann_2d_file
+        self.proposal_nms = proposal_nms
+        self.load_proposals()
+
+    def load_proposals(self):
+        if self.proposal_file is None:
+            return
+
+        if self.ann_2d_file is None:
+            self.proposal_coco = COCO(self.proposal_file)
+        else:
+            class COCO_wrapper(COCO):
+                def __init__(self, coco_file):
+                    for k, v in vars(coco_file).items():
+                        setattr(self, k, v)
+                    self.img_ann_map = self.imgToAnns
+                    self.cat_img_map = self.catToImgs
+
+                def get_ann_ids(self, img_ids=[], cat_ids=[], area_rng=[], iscrowd=None):
+                    return self.getAnnIds(img_ids, cat_ids, area_rng, iscrowd)
+
+                def get_cat_ids(self, cat_names=[], sup_names=[], cat_ids=[]):
+                    return self.getCatIds(cat_names, sup_names, cat_ids)
+
+                def get_img_ids(self, img_ids=[], cat_ids=[]):
+                    return self.getImgIds(img_ids, cat_ids)
+
+                def load_anns(self, ids):
+                    return self.loadAnns(ids)
+
+                def load_cats(self, ids):
+                    return self.loadCats(ids)
+
+                def load_imgs(self, ids):
+                    return self.loadImgs(ids)
+
+            coco = COCO(self.ann_2d_file)
+            proposal_coco = coco.loadRes(self.proposal_file)
+            del coco
+            self.proposal_coco = COCO_wrapper(proposal_coco)
+
+        self.cat_ids = self.proposal_coco.get_cat_ids(cat_names=self.CLASSES)
+        self.cat2label = {cat_id: i for i, cat_id in enumerate(self.cat_ids)}
+        self.impath_to_imgid = {}
+        self.imgid_to_dataid = {}
+        data_infos = []
+        total_ann_ids = []
+        for i in self.proposal_coco.get_img_ids():
+            info = self.proposal_coco.load_imgs([i])[0]
+            info['filename'] = info['file_name']
+            self.impath_to_imgid['./data/nuscenes/' + info['file_name']] = i
+            self.imgid_to_dataid[i] = len(data_infos)
+            data_infos.append(info)
+            ann_ids = self.proposal_coco.get_ann_ids(img_ids=[i])
+            total_ann_ids.extend(ann_ids)
+        assert len(set(total_ann_ids)) == len(
+            total_ann_ids), f"Annotation ids in '{self.proposal_file}' are not unique!"
+        self.proposal_infos = data_infos
+
+    def impath_to_proposals(self, impath):
+        img_id = self.impath_to_imgid[impath]
+        data_id = self.imgid_to_dataid[img_id]
+        ann_ids = self.proposal_coco.get_ann_ids(img_ids=[img_id])
+        ann_info = self.proposal_coco.load_anns(ann_ids)
+        return self.get_proposals(self.proposal_infos[data_id], ann_info)
+
+    def get_proposals(self, img_info, proposal_info):
+        proposal_bboxes = []
+        proposal_labels = []
+        proposal_scores = []
+        for i, ann in enumerate(proposal_info):
+            if ann.get('ignore', False):
+                continue
+            x1, y1, w, h = ann['bbox']
+            inter_w = max(0, min(x1 + w, img_info['width']) - max(x1, 0))
+            inter_h = max(0, min(y1 + h, img_info['height']) - max(y1, 0))
+            if inter_w * inter_h == 0:
+                continue
+            if ann['area'] <= 0 or w < 1 or h < 1:
+                continue
+            if ann['category_id'] not in self.cat_ids:
+                continue
+            bbox = [x1, y1, x1 + w, y1 + h]
+            if not ann.get('iscrowd', False):
+                proposal_bboxes.append(bbox)
+                proposal_labels.append(self.cat2label[ann['category_id']])
+                proposal_scores.append(ann['score'])
+
+        if proposal_bboxes:
+            proposal_bboxes = np.array(proposal_bboxes, dtype=np.float32)
+            proposal_labels = np.array(proposal_labels, dtype=np.int64)
+            proposal_scores = np.array(proposal_scores, dtype=np.float32)
+        else:
+            proposal_bboxes = np.zeros((0, 4), dtype=np.float32)
+            proposal_labels = np.array([], dtype=np.int64)
+            proposal_scores = np.array([], dtype=np.float32)
+
+        if self.proposal_nms is not None and len(proposal_bboxes) > 0:
+            score_thr = self.proposal_nms['score_thr']
+            nms_cfg = self.proposal_nms.get('nms')
+            class_agnostic = self.proposal_nms.get('class_agnostic', nms_cfg.get('class_agnostic'))
+            max_num = self.proposal_nms.get('max_num', -1)
+
+            # score filter
+            valid_mask = proposal_scores > score_thr
+            inds = valid_mask.nonzero()[0]
+            proposal_bboxes, proposal_scores, proposal_labels = proposal_bboxes[inds], proposal_scores[inds], proposal_labels[inds]
+
+            if len(proposal_bboxes) > 0:
+                boxes = torch.from_numpy(proposal_bboxes).clone()
+                scores = torch.from_numpy(proposal_scores).clone()
+                nms_labels = labels = torch.from_numpy(proposal_labels).clone()
+                if class_agnostic:
+                    nms_labels = torch.zeros_like(labels)
+                dets, keep = batched_nms(boxes, scores, nms_labels, nms_cfg)
+                if max_num > 0:
+                    dets = dets[:max_num]
+                    keep = keep[:max_num]
+                labels = labels[keep]
+
+                proposal_bboxes = dets[:, :4].numpy()
+                proposal_scores = dets[:, 4].numpy()
+                proposal_labels = labels.numpy()
+
+        proposals = np.concatenate([proposal_bboxes, proposal_scores[:, None], proposal_labels[:, None]], axis=-1, dtype=np.float32)
+        return proposals
 
     def _set_sequence_group_flag(self):
         """
@@ -58,15 +195,13 @@ class CustomNuScenesDataset(NuScenesDataset):
         if self.seq_split_num != 1:
             if self.seq_split_num == 'all':
                 self.flag = np.array(range(len(self.data_infos)), dtype=np.int64)
-            else:
+            elif self.seq_length <= 0:
                 bin_counts = np.bincount(self.flag)
                 new_flags = []
                 curr_new_flag = 0
                 for curr_flag in range(len(bin_counts)):
                     curr_sequence_length = np.array(
-                        list(range(0, 
-                                bin_counts[curr_flag], 
-                                math.ceil(bin_counts[curr_flag] / self.seq_split_num)))
+                        list(range(0, bin_counts[curr_flag], math.ceil(bin_counts[curr_flag] / self.seq_split_num)))
                         + [bin_counts[curr_flag]])
 
                     for sub_seq_idx in (curr_sequence_length[1:] - curr_sequence_length[:-1]):
@@ -77,7 +212,21 @@ class CustomNuScenesDataset(NuScenesDataset):
                 assert len(new_flags) == len(self.flag)
                 assert len(np.bincount(new_flags)) == len(np.bincount(self.flag)) * self.seq_split_num
                 self.flag = np.array(new_flags, dtype=np.int64)
+            else:
+                bin_counts = np.bincount(self.flag)
+                new_flags = []
+                curr_new_flag = 0
+                for curr_flag in range(len(bin_counts)):
+                    curr_sequence_length = np.array(
+                        list(range(0, bin_counts[curr_flag], self.seq_length)) + [bin_counts[curr_flag]])
 
+                    for sub_seq_idx in (curr_sequence_length[1:] - curr_sequence_length[:-1]):
+                        for _ in range(sub_seq_idx):
+                            new_flags.append(curr_new_flag)
+                        curr_new_flag += 1
+
+                assert len(new_flags) == len(self.flag)
+                self.flag = np.array(new_flags, dtype=np.int64)
 
     def prepare_train_data(self, index):
         """
@@ -135,6 +284,12 @@ class CustomNuScenesDataset(NuScenesDataset):
                 queue[-1][key] = DC(torch.stack([each[key].data for each in queue]), cpu_only=False, stack=True, pad_dims=None)
             else:
                 queue[-1][key] = DC([each[key].data for each in queue], cpu_only=True)
+        for key in ['points']:
+            if key in queue[-1]:
+                queue[-1][key] = DC([each[key].data for each in queue], cpu_only=False)
+        for key in ['proposals']:
+            if key in queue[-1]:
+                queue[-1][key] = DC([each[key].data for each in queue], cpu_only=False)
         if not self.test_mode:
             for key in ['gt_bboxes_3d', 'gt_labels_3d', 'gt_bboxes', 'gt_labels', 'centers2d', 'depths']:
                 if key == 'gt_bboxes_3d':
@@ -226,12 +381,21 @@ class CustomNuScenesDataset(NuScenesDataset):
                     extrinsics=extrinsics,
                     prev_exists=prev_exists,
                 ))
+
+            if self.proposal_file is not None:
+                proposals = []
+                for cam_i in range(len(image_paths)):
+                    proposals_cam_i = self.impath_to_proposals(image_paths[cam_i])
+                    proposals.append(proposals_cam_i)
+                input_dict['proposals'] = proposals
+
         if not self.test_mode:
             annos = self.get_ann_info(index)
             annos.update( 
                 dict(
                     bboxes=info['bboxes2d'],
                     labels=info['labels2d'],
+                    bboxes3d_cams=info['bboxes3d_cams'],
                     centers2d=info['centers2d'],
                     depths=info['depths'],
                     bboxes_ignore=info['bboxes_ignore'])
@@ -255,6 +419,67 @@ class CustomNuScenesDataset(NuScenesDataset):
                 idx = self._rand_another(idx)
                 continue
             return data
+
+    def _evaluate_single(self,
+                         result_path,
+                         logger=None,
+                         metric='bbox',
+                         result_name='pts_bbox'):
+        """Evaluation for a single model in nuScenes protocol.
+
+        Args:
+            result_path (str): Path of the result file.
+            logger (logging.Logger | str, optional): Logger used for printing
+                related information during evaluation. Default: None.
+            metric (str, optional): Metric name used for evaluation.
+                Default: 'bbox'.
+            result_name (str, optional): Result name in the metric prefix.
+                Default: 'pts_bbox'.
+
+        Returns:
+            dict: Dictionary of evaluation details.
+        """
+        from nuscenes import NuScenes
+        from nuscenes.eval.detection.evaluate import NuScenesEval
+
+        output_dir = osp.join(*osp.split(result_path)[:-1])
+        nusc = NuScenes(
+            version=self.version, dataroot=self.data_root, verbose=False)
+        eval_set_map = {
+            'v1.0-mini': 'mini_val',
+            'v1.0-trainval': 'val',
+            # 'v1.0-trainval': 'train',
+        }
+        nusc_eval = NuScenesEval(
+            nusc,
+            config=self.eval_detection_configs,
+            result_path=result_path,
+            eval_set=eval_set_map[self.version],
+            output_dir=output_dir,
+            verbose=False)
+
+        nusc_eval.main(render_curves=False)
+
+        # record metrics
+        metrics = mmcv.load(osp.join(output_dir, 'metrics_summary.json'))
+        detail = dict()
+        metric_prefix = f'{result_name}_NuScenes'
+        for name in self.CLASSES:
+            for k, v in metrics['label_aps'][name].items():
+                val = float('{:.4f}'.format(v))
+                detail['{}/{}_AP_dist_{}'.format(metric_prefix, name, k)] = val
+            for k, v in metrics['label_tp_errors'][name].items():
+                val = float('{:.4f}'.format(v))
+                detail['{}/{}_{}'.format(metric_prefix, name, k)] = val
+            for k, v in metrics['tp_errors'].items():
+                val = float('{:.4f}'.format(v))
+                detail['{}/{}'.format(metric_prefix,
+                                      self.ErrNameMapping[k])] = val
+
+        detail['{}/NDS'.format(metric_prefix)] = metrics['nd_score']
+        detail['{}/mAP'.format(metric_prefix)] = metrics['mean_ap']
+        return detail
+
 
 def invert_matrix_egopose_numpy(egopose):
     """ Compute the inverse transformation of a 4x4 egopose numpy matrix."""

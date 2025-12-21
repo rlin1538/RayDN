@@ -1,0 +1,355 @@
+_base_ = [
+    '../_base_/datasets/nus-3d.py',
+    '../_base_/default_runtime.py'
+]
+backbone_norm_cfg = dict(type='LN', requires_grad=True)
+plugin=True
+plugin_dir='projects/mmdet3d_plugin/'
+
+# If point cloud range is changed, the models should also change their point
+# cloud range accordingly
+point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+voxel_size = [0.2, 0.2, 8]
+img_norm_cfg = dict(
+    mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
+# For nuScenes we usually do 10-class detection
+class_names = [
+    'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
+    'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+]
+use_pointpillars = True
+use_height_backbone = False
+use_height_denoise = False
+use_pretrained_denoise = False
+pretrained_denoise_path = 'ckpts/light_weight_denoiser_norm.pth'
+grid_size = 0.075
+
+num_gpus = 1
+batch_size = 7
+num_iters_per_epoch = 28130 // (num_gpus * batch_size)
+num_epochs = 60
+
+img_ckpt = 'weights/mask_rcnn_r50_fpn_1x_nuim_20201008_195238-e99f5182.pth'
+queue_length = 1
+num_frame_losses = 1
+collect_keys=['lidar2img', 'intrinsics', 'extrinsics','timestamp', 'img_timestamp', 'ego_pose', 'ego_pose_inv']
+input_modality = dict(
+    use_lidar=True,
+    use_camera=True,
+    use_radar=False,
+    use_map=False,
+    use_external=True)
+model = dict(
+    type='RepDetr3D',
+    num_frame_head_grads=num_frame_losses,
+    num_frame_backbone_grads=num_frame_losses,
+    num_frame_losses=num_frame_losses,
+    use_grid_mask=True,
+    use_pointpillars=use_pointpillars,
+    use_height_backbone=use_height_backbone,
+    use_height_denoise=use_height_denoise,
+    use_pretrained_denoise=use_pretrained_denoise,
+    pretrained_denoise_path=pretrained_denoise_path,
+    pc_range=point_cloud_range,
+    stride=[8, 16, 32, 64],
+    position_level=[0, 1, 2, 3],
+    img_backbone=dict(
+        init_cfg=dict(
+            type='Pretrained', checkpoint="ckpts/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim_20201009_124951-40963960.pth",
+            prefix='backbone.'),       
+        type='ResNet',
+        depth=50,
+        num_stages=4,
+        out_indices=(0, 1, 2, 3),
+        frozen_stages=-1,
+        norm_cfg=dict(type='BN2d', requires_grad=False),
+        norm_eval=True,
+        with_cp=True,
+        style='pytorch'),
+    img_neck=dict(
+        type='FPN',  ###remove unused parameters 
+        start_level=1,
+        add_extra_convs='on_output',
+        relu_before_extra_convs=True,
+        in_channels=[256, 512, 1024, 2048],
+        out_channels=256,
+        num_outs=4),
+    pts_voxel_layer=dict(
+        max_num_points=10,
+        voxel_size=voxel_size,
+        max_voxels=(120000, 160000),
+        point_cloud_range=point_cloud_range),
+    pts_voxel_encoder=dict(
+        type='HardSimpleVFE',
+        num_features=5,
+    ),
+    pts_middle_encoder=dict(
+        type='SparseEncoder',
+        in_channels=5,
+        sparse_shape=[41, 1024, 1024],
+        output_channels=128,
+        order=('conv', 'norm', 'act'),
+        encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128, 128)),
+        encoder_paddings=((0, 0, 1), (0, 0, 1), (0, 0, [0, 1, 1]), (0, 0)),
+        block_type='basicblock'),
+    pts_backbone=dict(
+        type='SECOND',
+        in_channels=256,
+        out_channels=[128, 256],
+        layer_nums=[5, 5],
+        layer_strides=[1, 2],
+        norm_cfg=dict(type='BN', eps=0.001, momentum=0.01),
+        conv_cfg=dict(type='Conv2d', bias=False)),
+    pts_neck=dict(
+        type='FPN',
+        norm_cfg=dict(type='BN', eps=1e-3, momentum=0.01),
+        act_cfg=dict(type='ReLU'),
+        in_channels=[128, 256],
+        out_channels=128,
+        start_level=0,
+        num_outs=3),
+    
+
+    img_roi_head=dict(
+        type='YOLOXHeadCustom',
+        num_classes=10,
+        in_channels=256,
+        strides=[8, 16, 32, 64],
+        train_cfg=dict(assigner=dict(type='SimOTAAssigner', center_radius=2.5)),
+        test_cfg=dict(score_thr=0.01, nms=dict(type='nms', iou_threshold=0.65)),),
+    pts_bbox_head=dict(
+        type='RayDNHead',
+        num_classes=10,
+        in_channels=256,
+        num_query=300,
+        memory_len=512,
+        topk_proposals=128,
+        num_propagated=128,
+        scalar=10, ##noise groups
+        noise_scale = 1.0, 
+        dn_weight= 1.0, ##dn loss weight
+        split = 0.75, ###positive rate
+        with_dn=True,
+        raydn_group=1,
+        raydn_num=5,
+        raydn_alpha=8,
+        raydn_beta=2,
+        raydn_radius=3,
+        with_ego_pos=True,
+        match_with_velo=False,
+        use_height_backbone=use_height_backbone,
+        use_pointpillars=use_pointpillars,
+        code_weights = [2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        transformer=dict(
+            type='Detr3DTransformer',
+            decoder=dict(
+                type='Detr3DTransformerDecoder',
+                embed_dims=256,
+                num_layers=6,
+                transformerlayers=dict(
+                    type='Detr3DTemporalDecoderLayer',
+                    batch_first=True,
+                    attn_cfgs=[
+                        dict(
+                            type='MultiheadAttention',
+                            embed_dims=256,
+                            num_heads=8,
+                            dropout=0.1),
+                        dict(
+                            type='DeformableFeatureAggregationCuda', 
+                            embed_dims=256,
+                            num_groups=8,
+                            num_levels=4,
+                            num_cams=6,
+                            dropout=0.1,
+                            num_pts=13,
+                            bias=2.,
+                            attn_cfg=dict(
+                                type='PETRMultiheadFlashAttention',
+                                batch_first=False,
+                                embed_dims=256,
+                                num_heads=4,
+                                dropout=0.1),),
+                        ],
+                    feedforward_channels=2048,
+                    ffn_dropout=0.1,
+                    with_cp=True,  ###use checkpoint to save memory
+                    operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
+                                     'ffn', 'norm')),
+            )),
+        bbox_coder=dict(
+            type='NMSFreeCoder',
+            post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
+            pc_range=point_cloud_range,
+            max_num=300,
+            voxel_size=voxel_size,
+            num_classes=10), 
+        loss_cls=dict(
+            type='FocalLoss',
+            use_sigmoid=True,
+            gamma=2.0,
+            alpha=0.25,
+            loss_weight=2.0),
+        loss_bbox=dict(type='L1Loss', loss_weight=0.25),
+        loss_iou=dict(type='GIoULoss', loss_weight=0.0),),
+    # model training and testing settings
+    train_cfg=dict(pts=dict(
+        grid_size=[512, 512, 1],
+        voxel_size=voxel_size,
+        point_cloud_range=point_cloud_range,
+        out_size_factor=4,
+        assigner=dict(
+            type='HungarianAssigner3D',
+            cls_cost=dict(type='FocalLossCost', weight=2.0),
+            reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
+            iou_cost=dict(type='IoUCost', weight=0.0), # Fake cost. This is just to make it compatible with DETR head. 
+            pc_range=point_cloud_range),)))
+
+
+dataset_type = 'CustomNuScenesDataset'
+data_root = './data/nuscenes/'
+
+file_client_args = dict(backend='disk')
+
+
+ida_aug_conf = {
+        "resize_lim": (0.47, 0.625),
+        "final_dim": (320, 800),
+        "bot_pct_lim": (0.0, 0.0),
+        "rot_lim": (0.0, 0.0),
+        "H": 900,
+        "W": 1600,
+        "rand_flip": True,
+    }
+train_pipeline = [
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=5,
+        file_client_args=file_client_args),
+    dict(
+        type='LoadPointsFromMultiSweeps',
+        sweeps_num=9,
+        load_dim=5,
+        use_dim=[0, 1, 2, 3, 4],
+        pad_empty_sweeps=True,
+        remove_close=True,
+        file_client_args=file_client_args),
+    dict(type='LoadMultiViewImageFromFiles', to_float32=True),
+    dict(type='LoadAnnotations3D',  with_bbox_3d=True, with_label_3d=True, with_bbox=True,
+        with_label=True, with_bbox_depth=True),
+    dict(type='ResizeCropFlipRotImage', data_aug_conf=ida_aug_conf, training=True),
+    dict(type='BEVGlobalRotScaleTrans',
+         rot_range=[-1.57075, 1.57075],
+         translation_std=[0, 0, 0],
+         scale_ratio_range=[0.95, 1.05],
+         reverse_angle=True,
+         training=True,
+         ),
+    dict(type='BEVRandomFlip3D'),
+    dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='ObjectNameFilter', classes=class_names),
+    dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='NormalizePoints'),
+    dict(type='PointShuffle'),
+    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
+    dict(type='PadMultiViewImage', size_divisor=32),
+    dict(type='PETRFormatBundle3D', class_names=class_names,
+         collect_keys=collect_keys + ['prev_exists']),
+    dict(type='Collect3D', keys=['points', 'gt_bboxes_3d', 'gt_labels_3d', 'img', 'gt_bboxes', 'gt_labels', 'centers2d', 'depths',
+                                 'prev_exists'] + collect_keys,
+         meta_keys=(
+             'filename', 'ori_shape', 'img_shape', 'pad_shape', 'scale_factor', 'flip', 'box_mode_3d', 'box_type_3d',
+             'img_norm_cfg', 'scene_token', 'gt_bboxes_3d', 'gt_labels_3d'), )
+]
+test_pipeline = [
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=5,
+        file_client_args=file_client_args),
+    dict(
+        type='LoadPointsFromMultiSweeps',
+        sweeps_num=9,
+        load_dim=5,
+        use_dim=[0, 1, 2, 3, 4],
+        pad_empty_sweeps=True,
+        remove_close=True,
+        file_client_args=file_client_args),
+    dict(type='LoadMultiViewImageFromFiles', to_float32=True),
+    dict(type='ResizeCropFlipRotImage', data_aug_conf=ida_aug_conf, training=False),
+    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
+    dict(type='PadMultiViewImage', size_divisor=32),
+    dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='NormalizePoints'),
+    dict(
+        type='MultiScaleFlipAug3D',
+        img_scale=(1333, 800),
+        pts_scale_ratio=1,
+        flip=False,
+        transforms=[
+            dict(
+                type='PETRFormatBundle3D',
+                collect_keys=collect_keys + ['prev_exists'],
+                class_names=class_names,
+                with_label=False),
+            dict(type='Collect3D',
+                 keys=['points', 'img', 'prev_exists'] + collect_keys ,
+                 meta_keys=('filename', 'ori_shape', 'img_shape', 'pad_shape', 'scale_factor', 'flip', 'box_mode_3d',
+                            'box_type_3d', 'img_norm_cfg', 'scene_token', 'gt_bboxes_3d', 'gt_labels_3d'))
+        ])
+]
+
+data = dict(
+    samples_per_gpu=batch_size,
+    workers_per_gpu=4,
+    train=dict(
+        type=dataset_type,
+        data_root=data_root,
+        ann_file=data_root + 'nuscenes2d_temporal_infos_train.pkl',
+        num_frame_losses=num_frame_losses,
+        seq_split_num=2,
+        seq_mode=True,
+        pipeline=train_pipeline,
+        classes=class_names,
+        modality=input_modality,
+        collect_keys=collect_keys + ['img', 'prev_exists', 'img_metas'],
+        queue_length=queue_length,
+        test_mode=False,
+        use_valid_flag=True,
+        filter_empty_gt=False,
+        box_type_3d='LiDAR'),
+    val=dict(type=dataset_type, data_root=data_root, pipeline=test_pipeline, collect_keys=collect_keys + ['img', 'img_metas'], queue_length=queue_length, ann_file=data_root + 'nuscenes2d_temporal_infos_val.pkl', classes=class_names, modality=input_modality),
+    test=dict(type=dataset_type, data_root=data_root, pipeline=test_pipeline, collect_keys=collect_keys + ['img', 'img_metas'], queue_length=queue_length, ann_file=data_root + 'nuscenes2d_temporal_infos_test.pkl', classes=class_names, modality=input_modality),
+    shuffler_sampler=dict(type='InfiniteGroupEachSampleInBatchSampler'),
+    nonshuffler_sampler=dict(type='DistributedSampler')
+    )
+
+optimizer = dict(
+    type='AdamW', 
+    lr=2e-4, # bs 8: 2e-4 || bs 16: 4e-4
+    paramwise_cfg=dict(
+        custom_keys={
+            'img_backbone': dict(lr_mult=0.25), 
+        }),
+    weight_decay=0.01)
+
+optimizer_config = dict(type='Fp16OptimizerHook', loss_scale='dynamic', grad_clip=dict(max_norm=35, norm_type=2))
+# learning policy
+lr_config = dict(
+    policy='CosineAnnealing',
+    warmup='linear',
+    warmup_iters=500,
+    warmup_ratio=1.0 / 3,
+    min_lr_ratio=1e-3,
+    )
+
+evaluation = dict(interval=num_iters_per_epoch*num_epochs, pipeline=test_pipeline)
+find_unused_parameters=False #### when use checkpoint, find_unused_parameters must be False
+checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=3)
+runner = dict(
+    type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)
+load_from=None#'ckpts/cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim-remapped.pth'
+resume_from='work_dirs/0529_with_pointpillars_800/latest.pth'

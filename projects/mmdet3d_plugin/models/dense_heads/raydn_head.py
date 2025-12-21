@@ -35,6 +35,8 @@ class RayDNHead(AnchorFreeHead):
                  match_costs=None,
                  transformer=None,
                  sync_cls_avg_factor=False,
+                 use_height_backbone=False,
+                 use_pointpillars=False,
                  code_weights=None,
                  bbox_coder=None,
                  loss_cls=dict(
@@ -133,6 +135,8 @@ class RayDNHead(AnchorFreeHead):
         self.embed_dims = embed_dims
         self.with_dn = with_dn
         self.stride=stride
+        self.use_height_backbone = use_height_backbone
+        self.use_pointpillars = use_pointpillars
 
         self.scalar = scalar
         self.bbox_noise_scale = noise_scale
@@ -175,6 +179,13 @@ class RayDNHead(AnchorFreeHead):
         self.pc_range = nn.Parameter(torch.tensor(
             self.bbox_coder.pc_range), requires_grad=False)
 
+        if use_height_backbone or use_pointpillars:
+            self.pts_embed = nn.Sequential(
+                nn.Linear(128, self.embed_dims),
+                nn.LayerNorm(self.embed_dims),
+                nn.ReLU(),
+                nn.Linear(self.embed_dims, self.embed_dims),
+            )
 
         self._init_layers()
         self.reset_memory()
@@ -514,6 +525,13 @@ class RayDNHead(AnchorFreeHead):
         feat_flatten = torch.cat(feat_flatten, dim=1)
         spatial_flatten = torch.as_tensor(spatial_flatten, dtype=torch.long, device=mlvl_feats[0].device)
         level_start_index = torch.cat((spatial_flatten.new_zeros((1, )), spatial_flatten.prod(1).cumsum(0)[:-1]))
+        
+        feat_flatten_pts = None
+        pos_flatten_pts = None
+        if self.use_height_backbone or self.use_pointpillars:
+            feat_flatten_pts = self.pts_embed(data['pts_feats'])
+            pos_flatten_pts = data['pts_pos']
+        
         reference_points, attn_mask, mask_dict = self.prepare_for_dn(B, reference_points, img_metas, data)
         query_pos = self.query_embedding(pos2posemb3d(reference_points))
         tgt = torch.zeros_like(query_pos)
@@ -522,7 +540,7 @@ class RayDNHead(AnchorFreeHead):
         tgt, query_pos, reference_points, temp_memory, temp_pos, rec_ego_pose = self.temporal_alignment(query_pos, tgt, reference_points)
 
         outs_dec = self.transformer(tgt, query_pos, feat_flatten, spatial_flatten, level_start_index, temp_memory, 
-                                    temp_pos, attn_mask, reference_points, self.pc_range, data, img_metas)
+                                    temp_pos, attn_mask, reference_points, self.pc_range, data, img_metas, feat_flatten_pts, pos_flatten_pts)
 
         outs_dec = torch.nan_to_num(outs_dec)
         outputs_classes = []

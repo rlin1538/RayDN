@@ -20,6 +20,7 @@ import warnings
 import copy
 from torch.nn import ModuleList
 import torch.utils.checkpoint as cp
+import math
 
 # Disable warnings
 warnings.filterwarnings("ignore")
@@ -67,7 +68,9 @@ class Detr3DTransformer(BaseModule):
                 reference_points, 
                 pc_range, 
                 data, 
-                img_metas,):
+                img_metas,
+                feat_flatten_pts,
+                pos_flatten_pts):
         """Forward function for `Detr3DTransformer`.
         Args:
             mlvl_feats (list(Tensor)): Input queries from
@@ -119,7 +122,9 @@ class Detr3DTransformer(BaseModule):
             pc_range=pc_range, 
             lidar2img=lidar2img, 
             img_metas=img_metas,
-            attn_masks=attn_masks)
+            attn_masks=attn_masks,
+            feat_flatten_pts=feat_flatten_pts,
+            pos_flatten_pts=pos_flatten_pts)
 
         return inter_states
 
@@ -147,7 +152,9 @@ class Detr3DTransformerDecoder(TransformerLayerSequence):
                 pc_range, 
                 lidar2img, 
                 img_metas,
-                attn_masks):
+                attn_masks,
+                feat_flatten_pts,
+                pos_flatten_pts):
         """Forward function for `Detr3DTransformerDecoder`.
         Args:
             query (Tensor): Input query with shape
@@ -180,7 +187,9 @@ class Detr3DTransformerDecoder(TransformerLayerSequence):
                 pc_range, 
                 lidar2img, 
                 img_metas,
-                attn_masks)
+                attn_masks,
+                feat_flatten_pts=feat_flatten_pts,
+                pos_flatten_pts=pos_flatten_pts)
 
             intermediate.append(query)
 
@@ -320,6 +329,8 @@ class Detr3DTemporalDecoderLayer(BaseModule):
                 attn_masks=None,
                 query_key_padding_mask=None,
                 key_padding_mask=None,
+                feat_flatten_pts=None,
+                pos_flatten_pts=None,
                 **kwargs):
         """Forward function for `TransformerDecoderLayer`.
 
@@ -406,6 +417,8 @@ class Detr3DTemporalDecoderLayer(BaseModule):
                     pc_range, 
                     lidar2img, 
                     img_metas,
+                    feat_flatten_pts,
+                    pos_flatten_pts,
                     **kwargs)
                 attn_index += 1
                 identity = query
@@ -432,6 +445,8 @@ class Detr3DTemporalDecoderLayer(BaseModule):
                 attn_masks=None,
                 query_key_padding_mask=None,
                 key_padding_mask=None,
+                feat_flatten_pts=None,
+                pos_flatten_pts=None,
                 ):
         """Forward function for `TransformerCoder`.
         Returns:
@@ -455,6 +470,8 @@ class Detr3DTemporalDecoderLayer(BaseModule):
                 attn_masks,
                 query_key_padding_mask,
                 key_padding_mask,
+                feat_flatten_pts,
+                pos_flatten_pts
                 )
         else:
             x = self._forward(
@@ -472,6 +489,8 @@ class Detr3DTemporalDecoderLayer(BaseModule):
             attn_masks,
             query_key_padding_mask,
             key_padding_mask,
+            feat_flatten_pts,
+            pos_flatten_pts
         )
         return x
 
@@ -489,6 +508,8 @@ class DeformableFeatureAggregationCuda(BaseModule):
             im2col_step=64,
             batch_first=True,
             bias=1.,
+            bev_norm=1,
+            attn_cfg=None
             ):
         super(DeformableFeatureAggregationCuda, self).__init__()
         self.embed_dims = embed_dims
@@ -496,6 +517,7 @@ class DeformableFeatureAggregationCuda(BaseModule):
         self.group_dims = (self.embed_dims // self.num_groups)
         self.num_levels = num_levels
         self.num_cams = num_cams
+        self.num_pts = num_pts
         self.weights_fc = nn.Linear(self.embed_dims, self.num_groups * self.num_levels * num_pts)
         self.output_proj = nn.Linear(self.embed_dims, self.embed_dims)
         self.learnable_fc = nn.Linear(self.embed_dims, num_pts * 3)
@@ -506,16 +528,48 @@ class DeformableFeatureAggregationCuda(BaseModule):
             nn.ReLU(inplace=True),
             nn.LayerNorm(self.embed_dims),
         )
+        self.attn = None
+        if attn_cfg is not None:
+            self.attn = build_attention(attn_cfg)
+            self.pts_q_embed = nn.Sequential(
+                nn.Linear(13 * 32, self.embed_dims),
+                nn.ReLU(),
+                nn.Linear(self.embed_dims, self.embed_dims),
+            )
+            self.pts_k_embed = nn.Sequential(
+                nn.Linear(self.embed_dims, self.embed_dims),
+                nn.ReLU(),
+                nn.Linear(self.embed_dims, self.embed_dims),
+            )
+            self.weights_fc_pts = nn.Linear(self.embed_dims, num_pts)
+            self.pts_q_prob = SELayer_Linear(self.embed_dims, num_pts)
+            self.bev_norm = bev_norm
+        
         self.drop = nn.Dropout(dropout)
         self.im2col_step = im2col_step
         self.bias = bias
 
+    def pos2posemb2d(self, pos, num_pos_feats=128, temperature=20):
+        scale = 2 * math.pi
+        pos = pos * scale
+        dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=pos.device)
+        dim_t = temperature ** (2 * torch.div(dim_t, 2, rounding_mode='floor') / num_pos_feats)
+        pos_x = pos[..., 0, None] / dim_t
+        pos_y = pos[..., 1, None] / dim_t
+        pos_x = torch.stack((pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()), dim=-1).flatten(-2)
+        pos_y = torch.stack((pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()), dim=-1).flatten(-2)
+        posemb = torch.cat((pos_y, pos_x), dim=-1)
+        return posemb
+
     def init_weight(self):
         constant_init(self.weights_fc, val=0.0, bias=0.0)
+        if self.attn is not None:
+            constant_init(self.weights_fc_pts, val=0.0, bias=0.0)
         xavier_init(self.output_proj, distribution="uniform", bias=0.0)
         nn.init.uniform_(self.learnable_fc.bias.data, -self.bias, self.bias)    
 
-    def forward(self, instance_feature, query_pos,feat_flatten, reference_points, spatial_flatten, level_start_index, pc_range, lidar2img_mat, img_metas):
+    def forward(self, instance_feature, query_pos,feat_flatten, reference_points, spatial_flatten,
+                level_start_index, pc_range, lidar2img_mat, img_metas, feat_flatten_pts, pos_flatten_pts):
         bs, num_anchor = reference_points.shape[:2]
         reference_points = get_global_pos(reference_points, pc_range)
         key_points = reference_points.unsqueeze(-2) + self.learnable_fc(instance_feature).reshape(bs, num_anchor, -1, 3)
@@ -526,6 +580,20 @@ class DeformableFeatureAggregationCuda(BaseModule):
 
         output = self.output_proj(features)
         output = self.drop(output) + instance_feature
+
+        # point cloud cross-attention
+        if feat_flatten_pts is not None and self.attn is not None:
+            weights_pts = self._get_weights_pts(instance_feature, query_pos)
+            key_points = (key_points[..., 0:2] - pc_range[0:2]) / (pc_range[3:5] - pc_range[0:2])   # [B, n_q, 13, 2]
+            pts_q_pos = self.pts_q_embed(self.pos2posemb2d(key_points, num_pos_feats=16).flatten(-2, -1))
+            pts_k_pos = self.pts_k_embed(self.pos2posemb2d(pos_flatten_pts / self.bev_norm, num_pos_feats=128))
+            pts_q_pos = self.pts_q_prob(pts_q_pos, weights_pts.flatten(-2, -1))
+            output = self.attn(
+                output,
+                key=feat_flatten_pts,
+                value=feat_flatten_pts,
+                query_pos=pts_q_pos,
+                key_pos=pts_k_pos,)
         return output
 
     def _get_weights(self, instance_feature, anchor_embed, lidar2img_mat):
@@ -536,6 +604,13 @@ class DeformableFeatureAggregationCuda(BaseModule):
         weights = self.weights_fc(feat_pos).reshape(bs, num_anchor, -1, self.num_groups).softmax(dim=-2)
         weights = weights.reshape(bs, num_anchor, self.num_cams, -1, self.num_groups).permute(0, 2, 1, 4, 3).contiguous()
         return weights.flatten(end_dim=1)
+
+    def _get_weights_pts(self, instance_feature, anchor_embed):
+        bs, num_anchor = instance_feature.shape[:2]
+        feat_pos_pts = instance_feature + anchor_embed  # [B, n_q, C]
+        weights = self.weights_fc_pts(feat_pos_pts).reshape(bs, num_anchor, self.num_pts, -1).softmax(dim=-2)    # [B, n_q, n_pts, n_groups]
+        weights = weights.reshape(bs, num_anchor, self.num_pts, -1).permute(0, 1, 3, 2).contiguous()
+        return weights
 
     def feature_sampling(self, feat_flatten, spatial_flatten, level_start_index, key_points, weights, lidar2img_mat, img_metas):
         bs, num_anchor, _ = key_points.shape[:3]
@@ -560,3 +635,182 @@ class DeformableFeatureAggregationCuda(BaseModule):
         output = output.reshape(bs, self.num_cams, num_anchor, -1)
 
         return output.sum(1)
+
+@ATTENTION.register_module()
+class MixedCrossAttention(BaseModule):
+    def __init__(
+            self,
+            embed_dims=256,
+            num_groups=8,
+            num_levels=4,
+            num_cams=6,
+            dropout=0.1,
+            num_pts=13,
+            im2col_step=64,
+            batch_first=True,
+            bias=2.,
+            bev_norm=1,
+            attn_cfg=None,
+    ):
+        super(MixedCrossAttention, self).__init__()
+        self.embed_dims = embed_dims
+
+        # image ca params
+        self.num_groups = num_groups
+        self.group_dims = (self.embed_dims // self.num_groups)
+        self.num_levels = num_levels
+        self.num_cams = num_cams
+        self.num_pts = num_pts
+        self.weights_fc_img = nn.Linear(self.embed_dims, self.num_groups * self.num_levels * num_pts)
+        self.output_proj_img = nn.Linear(self.embed_dims, self.embed_dims)
+        self.learnable_fc = nn.Linear(self.embed_dims, num_pts * 3)
+        self.cam_embed = nn.Sequential(
+            nn.Linear(12, self.embed_dims // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.embed_dims // 2, self.embed_dims),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm(self.embed_dims),
+        )
+
+        # point cloud ca params
+        self.attn = build_attention(attn_cfg)
+        self.pts_q_embed = nn.Sequential(
+            nn.Linear(13 * 32, self.embed_dims),
+            nn.ReLU(),
+            nn.Linear(self.embed_dims, self.embed_dims),
+        )
+        self.pts_k_embed = nn.Sequential(
+            nn.Linear(self.embed_dims, self.embed_dims),
+            nn.ReLU(),
+            nn.Linear(self.embed_dims, self.embed_dims),
+        )
+        self.weights_fc_pts = nn.Linear(self.embed_dims, num_pts)
+        self.pts_q_prob = SELayer_Linear(self.embed_dims, num_pts)
+
+        self.drop = nn.Dropout(dropout)
+        self.im2col_step = im2col_step
+        self.bias = bias
+        self.bev_norm = bev_norm
+
+    def pos2posemb2d(self, pos, num_pos_feats=128, temperature=20):
+        scale = 2 * math.pi
+        pos = pos * scale
+        dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=pos.device)
+        dim_t = temperature ** (2 * torch.div(dim_t, 2, rounding_mode='floor') / num_pos_feats)
+        pos_x = pos[..., 0, None] / dim_t
+        pos_y = pos[..., 1, None] / dim_t
+        pos_x = torch.stack((pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()), dim=-1).flatten(-2)
+        pos_y = torch.stack((pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()), dim=-1).flatten(-2)
+        posemb = torch.cat((pos_y, pos_x), dim=-1)
+        return posemb
+
+    def init_weights(self):
+        nn.init.uniform_(self.learnable_fc.bias.data, -self.bias, self.bias)
+        constant_init(self.weights_fc_img, val=0.0, bias=0.0)
+        constant_init(self.weights_fc_pts, val=0.0, bias=0.0)
+        xavier_init(self.output_proj_img, distribution="uniform", bias=0.0)
+
+    def forward(self, instance_feature, query_pos, feat_flatten_img, reference_points, spatial_flatten_img,
+                level_start_index_img, pc_range, lidar2img_mat, img_metas, feat_flatten_pts,
+                pos_flatten_pts, ):
+
+        bs, num_anchor = reference_points.shape[:2]
+
+        reference_points = reference_points * (pc_range[3:6] - pc_range[0:3]) + pc_range[0:3]
+        key_points = reference_points.unsqueeze(-2) + self.learnable_fc(instance_feature).reshape(bs, num_anchor, -1, 3)
+
+        # image cross-attention
+        weights_img = self._get_weights_img(instance_feature, query_pos, lidar2img_mat)
+        features_img = self.feature_sampling_img(feat_flatten_img, spatial_flatten_img, level_start_index_img,
+                                                 key_points, weights_img, lidar2img_mat, img_metas)
+        output = self.output_proj_img(features_img)
+        output = self.drop(output) + instance_feature
+
+        # point cloud cross-attention
+        if feat_flatten_pts is not None:
+            weights_pts = self._get_weights_pts(instance_feature, query_pos)
+            key_points = (key_points[..., 0:2] - pc_range[0:2]) / (pc_range[3:5] - pc_range[0:2])   # [B, n_q, 13, 2]
+            pts_q_pos = self.pts_q_embed(self.pos2posemb2d(key_points, num_pos_feats=16).flatten(-2, -1))
+            pts_k_pos = self.pts_k_embed(self.pos2posemb2d(pos_flatten_pts / self.bev_norm, num_pos_feats=128))
+            pts_q_pos = self.pts_q_prob(pts_q_pos, weights_pts.flatten(-2, -1))
+            output = self.attn(
+                output,
+                key=feat_flatten_pts,
+                value=feat_flatten_pts,
+                query_pos=pts_q_pos,
+                key_pos=pts_k_pos,)
+
+        return output
+
+    def _get_weights_img(self, instance_feature, anchor_embed, lidar2img_mat, dyn_q_mask=None, dyn_feats=None):
+        bs, num_anchor = instance_feature.shape[:2]
+        lidar2img = lidar2img_mat[..., :3, :].flatten(-2)
+        cam_embed = self.cam_embed(lidar2img)  # B, N, C
+        feat_pos_img = (instance_feature + anchor_embed).unsqueeze(2) + cam_embed.unsqueeze(1)
+        weights = self.weights_fc_img(feat_pos_img).reshape(bs, num_anchor, -1, self.num_groups).softmax(dim=-2)
+        weights = weights.reshape(bs, num_anchor, self.num_cams, -1, self.num_groups).permute(0, 2, 1, 4,
+                                                                                              3).contiguous()
+        return weights.flatten(end_dim=1)
+
+    def _get_weights_pts(self, instance_feature, anchor_embed):
+        bs, num_anchor = instance_feature.shape[:2]
+        feat_pos_pts = instance_feature + anchor_embed  # [B, n_q, C]
+        weights = self.weights_fc_pts(feat_pos_pts).reshape(bs, num_anchor, self.num_pts, -1).softmax(dim=-2)    # [B, n_q, n_pts, n_groups]
+        weights = weights.reshape(bs, num_anchor, self.num_pts, -1).permute(0, 1, 3, 2).contiguous()
+        return weights
+
+    def feature_sampling_img(self, feat_flatten, spatial_flatten, level_start_index, key_points, weights, lidar2img_mat,
+                         img_metas):
+        # key_points: [B, n_q, num_pts, 3]
+        # lidar2img_mat: [B, V, 4, 4]
+        bs, num_anchor, _ = key_points.shape[:3]
+
+        pts_extand = torch.cat([key_points, torch.ones_like(key_points[..., :1])], dim=-1)
+        # points_2d: [B, V, n_q, num_pts, 3]
+        points_2d = torch.matmul(lidar2img_mat[:, :, None, None], pts_extand[:, None, ..., None]).squeeze(-1)
+
+        points_2d = points_2d[..., :2] / torch.clamp(points_2d[..., 2:3], min=1e-5)
+        points_2d[..., 0:1] = points_2d[..., 0:1] / img_metas[0]['pad_shape'][0][1]
+        points_2d[..., 1:2] = points_2d[..., 1:2] / img_metas[0]['pad_shape'][0][0]
+
+        points_2d = points_2d.flatten(end_dim=1)  # [B * V, n_q, num_pts, 2]
+        points_2d = points_2d[:, :, None, None, :, :].repeat(1, 1, self.num_groups, self.num_levels, 1, 1)
+
+        bn, num_value, _ = feat_flatten.size()
+        feat_flatten = feat_flatten.reshape(bn, num_value, self.num_groups, -1)
+        # points_2d: [B * V, n_groups, n_levels, n_q, num_pts, 2]
+        # weights: [B * V, n_q, n_groups, n_levels * n_pts]
+        output = MultiScaleDeformableAttnFunction.apply(
+            feat_flatten, spatial_flatten, level_start_index, points_2d,
+            weights, self.im2col_step)
+
+        output = output.reshape(bs, self.num_cams, num_anchor, -1)
+
+        return output.sum(1)
+
+
+class SELayer_Linear(BaseModule):
+    def __init__(self, channels, in_channels=None, out_channels=None, act_layer=nn.ReLU, gate_layer=nn.Sigmoid):
+        super().__init__()
+        if in_channels is None:
+            in_channels = channels
+        self.conv_reduce = nn.Linear(in_channels, channels)
+        self.act1 = act_layer()
+        self.conv_expand = nn.Linear(channels, channels)
+        self.gate = gate_layer()
+        if out_channels is not None:
+            self.conv_last = nn.Sequential(
+                nn.Linear(channels, out_channels),
+                nn.LayerNorm(out_channels),
+                nn.ReLU(inplace=True),
+                nn.Linear(out_channels, out_channels)
+            )
+
+    def forward(self, x, x_se):
+        x_se = self.conv_reduce(x_se)
+        x_se = self.act1(x_se)
+        x_se = self.conv_expand(x_se)
+        out = x * self.gate(x_se)
+        if hasattr(self, 'conv_last'):
+            out = self.conv_last(out)
+        return out
