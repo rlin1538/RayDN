@@ -544,10 +544,17 @@ class DeformableFeatureAggregationCuda(BaseModule):
             self.weights_fc_pts = nn.Linear(self.embed_dims, num_pts)
             self.pts_q_prob = SELayer_Linear(self.embed_dims, num_pts)
             self.bev_norm = bev_norm
-        
+
         self.drop = nn.Dropout(dropout)
         self.im2col_step = im2col_step
         self.bias = bias
+
+        # For attention visualization
+        self.save_attention = False
+        self.attention_weights_img = None
+        self.attention_weights_pts = None
+        self.sampled_points_2d = None
+        self.sampled_points_3d = None
 
     def pos2posemb2d(self, pos, num_pos_feats=128, temperature=20):
         scale = 2 * math.pi
@@ -576,7 +583,13 @@ class DeformableFeatureAggregationCuda(BaseModule):
 
         weights = self._get_weights(instance_feature, query_pos, lidar2img_mat)
 
-        features = self.feature_sampling(feat_flatten, spatial_flatten, level_start_index, key_points, weights, lidar2img_mat, img_metas)
+        features, sampled_points_2d = self.feature_sampling(feat_flatten, spatial_flatten, level_start_index, key_points, weights, lidar2img_mat, img_metas)
+
+        # Save attention weights if visualization is enabled
+        if self.save_attention:
+            self.attention_weights_img = weights.detach().cpu()
+            self.sampled_points_3d = key_points.detach().cpu()
+            self.sampled_points_2d = sampled_points_2d.detach().cpu()
 
         output = self.output_proj(features)
         output = self.drop(output) + instance_feature
@@ -584,8 +597,8 @@ class DeformableFeatureAggregationCuda(BaseModule):
         # point cloud cross-attention
         if feat_flatten_pts is not None and self.attn is not None:
             weights_pts = self._get_weights_pts(instance_feature, query_pos)
-            key_points = (key_points[..., 0:2] - pc_range[0:2]) / (pc_range[3:5] - pc_range[0:2])   # [B, n_q, 13, 2]
-            pts_q_pos = self.pts_q_embed(self.pos2posemb2d(key_points, num_pos_feats=16).flatten(-2, -1))
+            key_points_2d = (key_points[..., 0:2] - pc_range[0:2]) / (pc_range[3:5] - pc_range[0:2])   # [B, n_q, 13, 2]
+            pts_q_pos = self.pts_q_embed(self.pos2posemb2d(key_points_2d, num_pos_feats=16).flatten(-2, -1))
             pts_k_pos = self.pts_k_embed(self.pos2posemb2d(pos_flatten_pts / self.bev_norm, num_pos_feats=128))
             pts_q_pos = self.pts_q_prob(pts_q_pos, weights_pts.flatten(-2, -1))
             output = self.attn(
@@ -594,6 +607,11 @@ class DeformableFeatureAggregationCuda(BaseModule):
                 value=feat_flatten_pts,
                 query_pos=pts_q_pos,
                 key_pos=pts_k_pos,)
+
+            # Save point cloud attention weights if visualization is enabled
+            if self.save_attention:
+                self.attention_weights_pts = weights_pts.detach().cpu()
+
         return output
 
     def _get_weights(self, instance_feature, anchor_embed, lidar2img_mat):
@@ -618,6 +636,15 @@ class DeformableFeatureAggregationCuda(BaseModule):
         pts_extand = torch.cat([key_points, torch.ones_like(key_points[..., :1])], dim=-1)
         points_2d = torch.matmul(lidar2img_mat[:, :, None, None], pts_extand[:, None, ..., None]).squeeze(-1)
 
+        # Store points in pixel coordinates BEFORE normalization for visualization
+        # points_2d shape: [B, num_cams, num_anchor, num_pts, 3] (x, y, depth)
+        depth = points_2d[..., 2:3].clone()
+        points_2d_pixel = points_2d[..., :2] / torch.clamp(depth, min=1e-5)
+
+        # Clone for visualization before normalization
+        points_2d_unnorm = points_2d_pixel.clone()
+
+        # Now normalize for network
         points_2d = points_2d[..., :2] / torch.clamp(points_2d[..., 2:3], min=1e-5)
         points_2d[..., 0:1] = points_2d[..., 0:1] / img_metas[0]['pad_shape'][0][1]
         points_2d[..., 1:2] = points_2d[..., 1:2] / img_metas[0]['pad_shape'][0][0]
@@ -631,10 +658,10 @@ class DeformableFeatureAggregationCuda(BaseModule):
         output = MultiScaleDeformableAttnFunction.apply(
                 feat_flatten, spatial_flatten, level_start_index, points_2d,
                 weights, self.im2col_step)
-        
+
         output = output.reshape(bs, self.num_cams, num_anchor, -1)
 
-        return output.sum(1)
+        return output.sum(1), points_2d_unnorm
 
 @ATTENTION.register_module()
 class MixedCrossAttention(BaseModule):
@@ -692,6 +719,13 @@ class MixedCrossAttention(BaseModule):
         self.bias = bias
         self.bev_norm = bev_norm
 
+        # For attention visualization
+        self.save_attention = False
+        self.attention_weights_img = None
+        self.attention_weights_pts = None
+        self.sampled_points_2d = None
+        self.sampled_points_3d = None
+
     def pos2posemb2d(self, pos, num_pos_feats=128, temperature=20):
         scale = 2 * math.pi
         pos = pos * scale
@@ -721,8 +755,15 @@ class MixedCrossAttention(BaseModule):
 
         # image cross-attention
         weights_img = self._get_weights_img(instance_feature, query_pos, lidar2img_mat)
-        features_img = self.feature_sampling_img(feat_flatten_img, spatial_flatten_img, level_start_index_img,
+        features_img, sampled_points_2d = self.feature_sampling_img(feat_flatten_img, spatial_flatten_img, level_start_index_img,
                                                  key_points, weights_img, lidar2img_mat, img_metas)
+
+        # Save image attention weights if visualization is enabled
+        if self.save_attention:
+            self.attention_weights_img = weights_img.detach().cpu()
+            self.sampled_points_3d = key_points.detach().cpu()
+            self.sampled_points_2d = sampled_points_2d.detach().cpu()
+
         output = self.output_proj_img(features_img)
         output = self.drop(output) + instance_feature
 
@@ -739,6 +780,10 @@ class MixedCrossAttention(BaseModule):
                 value=feat_flatten_pts,
                 query_pos=pts_q_pos,
                 key_pos=pts_k_pos,)
+
+            # Save point cloud attention weights if visualization is enabled
+            if self.save_attention:
+                self.attention_weights_pts = weights_pts.detach().cpu()
 
         return output
 
@@ -769,6 +814,14 @@ class MixedCrossAttention(BaseModule):
         # points_2d: [B, V, n_q, num_pts, 3]
         points_2d = torch.matmul(lidar2img_mat[:, :, None, None], pts_extand[:, None, ..., None]).squeeze(-1)
 
+        # Store points in pixel coordinates BEFORE normalization for visualization
+        depth = points_2d[..., 2:3].clone()
+        points_2d_pixel = points_2d[..., :2] / torch.clamp(depth, min=1e-5)
+
+        # Clone for visualization before normalization
+        points_2d_unnorm = points_2d_pixel.clone()
+
+        # Now normalize for network
         points_2d = points_2d[..., :2] / torch.clamp(points_2d[..., 2:3], min=1e-5)
         points_2d[..., 0:1] = points_2d[..., 0:1] / img_metas[0]['pad_shape'][0][1]
         points_2d[..., 1:2] = points_2d[..., 1:2] / img_metas[0]['pad_shape'][0][0]
@@ -786,7 +839,7 @@ class MixedCrossAttention(BaseModule):
 
         output = output.reshape(bs, self.num_cams, num_anchor, -1)
 
-        return output.sum(1)
+        return output.sum(1), points_2d_unnorm
 
 
 class SELayer_Linear(BaseModule):
